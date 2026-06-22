@@ -105,6 +105,16 @@ type (
 	}
 )
 
+// Messages for OpenAI auth choice dialog.
+type (
+	ActionSelectOpenAIAuthMethod struct {
+		Method    string
+		Provider  catwalk.Provider
+		Model     config.SelectedModel
+		ModelType config.SelectedModelType
+	}
+)
+
 // Messages for OAuth2 device flow dialog.
 type (
 	// ActionInitiateOAuth is sent when the device auth is initiated

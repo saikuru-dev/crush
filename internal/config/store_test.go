@@ -726,6 +726,68 @@ func TestRefreshOAuthToken_UsesDiskTokenWhenDifferent(t *testing.T) {
 	require.Equal(t, "refresh-abc", updatedConfig.OAuthToken.RefreshToken)
 }
 
+func TestSetProviderAPIKey_OpenAIStringClearsOAuthAndFlatRate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+
+	providers := csync.NewMap[string, ProviderConfig]()
+	providers.Set("openai", ProviderConfig{
+		ID:       "openai",
+		Name:     "OpenAI",
+		APIKey:   "old-key",
+		FlatRate: true,
+		OAuthToken: &oauth.Token{
+			AccessToken:  "old-key",
+			RefreshToken: "refresh-old",
+			ExpiresIn:    3600,
+		},
+	})
+
+	store := &ConfigStore{
+		config: &Config{
+			Providers: providers,
+		},
+		globalDataPath: configPath,
+		workingDir:     dir,
+	}
+
+	require.NoError(t, store.SetProviderAPIKey(ScopeGlobal, "openai", "sk-new"))
+
+	updated, ok := store.config.Providers.Get("openai")
+	require.True(t, ok)
+	require.Equal(t, "sk-new", updated.APIKey)
+	require.Nil(t, updated.OAuthToken)
+	require.False(t, updated.FlatRate)
+}
+
+func TestSetProviderAPIKey_OpenAITokenEnablesFlatRate(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "crush.json")
+
+	providers := csync.NewMap[string, ProviderConfig]()
+	providers.Set("openai", ProviderConfig{ID: "openai", Name: "OpenAI"})
+
+	token := &oauth.Token{AccessToken: "oauth-access", RefreshToken: "oauth-refresh", ExpiresIn: 3600}
+	store := &ConfigStore{
+		config:         &Config{Providers: providers},
+		globalDataPath: configPath,
+		workingDir:     dir,
+	}
+
+	require.NoError(t, store.SetProviderAPIKey(ScopeGlobal, "openai", token))
+
+	updated, ok := store.config.Providers.Get("openai")
+	require.True(t, ok)
+	require.Equal(t, "oauth-access", updated.APIKey)
+	require.NotNil(t, updated.OAuthToken)
+	require.Equal(t, "oauth-access", updated.OAuthToken.AccessToken)
+	require.True(t, updated.FlatRate)
+}
+
 // TestConfigStore_SetConfigFields_concurrentInProcess verifies that
 // concurrent in-process writes do not lose data when serialized by the
 // s.mu mutex. This does not exercise the cross-process flock; testing

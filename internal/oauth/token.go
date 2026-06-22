@@ -16,6 +16,7 @@ type Token struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresIn    int    `json:"expires_in"`
 	ExpiresAt    int64  `json:"expires_at"`
+	AccountID    string `json:"account_id,omitempty"`
 }
 
 // SetExpiresAt calculates and sets the ExpiresAt field based on the

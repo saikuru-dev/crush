@@ -1044,6 +1044,12 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 
 	switch providerCfg.Type {
 	case openai.Name:
+		if providerCfg.OAuthToken != nil && providerCfg.FlatRate {
+			if providerCfg.OAuthToken.AccountID != "" {
+				headers["ChatGPT-Account-Id"] = providerCfg.OAuthToken.AccountID
+			}
+			baseURL = "https://chatgpt.com/backend-api/codex"
+		}
 		return c.buildOpenaiProvider(baseURL, apiKey, headers)
 	case anthropic.Name:
 		return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID)

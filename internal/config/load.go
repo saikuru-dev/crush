@@ -295,6 +295,11 @@ func (c *Config) configureProviders(ctx context.Context, store *ConfigStore, env
 			store.RemoveConfigField(ScopeGlobal, "providers.anthropic")
 			c.Providers.Del(string(p.ID))
 			continue
+		case p.ID == catwalk.InferenceProviderOpenAI && config.OAuthToken != nil:
+			prepared.FlatRate = true
+			if prepared.APIKey == "" {
+				prepared.APIKey = config.OAuthToken.AccessToken
+			}
 		case p.ID == catwalk.InferenceProviderCopilot && config.OAuthToken != nil:
 			prepared.SetupGitHubCopilot()
 		}

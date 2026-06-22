@@ -73,6 +73,50 @@ var (
 	orphanThinkTagRegex = regexp.MustCompile(`</?think>`)
 )
 
+func openAIResponsesProviderOptions(model Model, systemPrompt string, providerOptions fantasy.ProviderOptions) fantasy.ProviderOptions {
+	if systemPrompt == "" || !openai.IsResponsesModel(model.CatwalkCfg.ID) {
+		return providerOptions
+	}
+
+	updated := make(fantasy.ProviderOptions, len(providerOptions)+1)
+	for k, v := range providerOptions {
+		updated[k] = v
+	}
+
+	responsesOpts := &openai.ResponsesProviderOptions{Instructions: &systemPrompt}
+	if existing, ok := providerOptions[openai.Name]; ok {
+		if typed, ok := existing.(*openai.ResponsesProviderOptions); ok && typed != nil {
+			responsesOpts = &openai.ResponsesProviderOptions{}
+			*responsesOpts = *typed
+			if responsesOpts.Instructions != nil && strings.TrimSpace(*responsesOpts.Instructions) != "" {
+				merged := strings.TrimSpace(systemPrompt) + "\n\n" + strings.TrimSpace(*responsesOpts.Instructions)
+				responsesOpts.Instructions = &merged
+			} else {
+				responsesOpts.Instructions = &systemPrompt
+			}
+		}
+	}
+	if responsesOpts.Instructions == nil || strings.TrimSpace(*responsesOpts.Instructions) == "" {
+		responsesOpts.Instructions = &systemPrompt
+	}
+	updated[openai.Name] = responsesOpts
+	return updated
+}
+
+func stripLeadingSystemMessage(messages []fantasy.Message) []fantasy.Message {
+	if len(messages) == 0 || messages[0].Role != fantasy.MessageRoleSystem {
+		return messages
+	}
+
+	stripped := make([]fantasy.Message, len(messages)-1)
+	copy(stripped, messages[1:])
+	return stripped
+}
+
+func openAIResponsesSupportsMaxOutputTokens(model Model) bool {
+	return !model.FlatRate || !openai.IsResponsesModel(model.CatwalkCfg.ID)
+}
+
 type SessionAgentCall struct {
 	SessionID string
 	// RunID, when non-empty, is the caller-supplied correlator that
@@ -785,14 +829,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 	sanitizedToolCalls := make(map[string]bool)
 	// Don't send MaxOutputTokens if 0 — some providers (e.g. LM Studio) reject it
 	var maxOutputTokens *int64
-	if call.MaxOutputTokens > 0 {
+	if call.MaxOutputTokens > 0 && openAIResponsesSupportsMaxOutputTokens(largeModel) {
 		maxOutputTokens = &call.MaxOutputTokens
 	}
 	result, err = agent.Stream(genCtx, fantasy.AgentStreamCall{
 		Prompt:           message.PromptWithTextAttachments(call.Prompt, call.Attachments),
 		Files:            files,
 		Messages:         history,
-		ProviderOptions:  call.ProviderOptions,
+		ProviderOptions:  openAIResponsesProviderOptions(largeModel, systemPrompt, call.ProviderOptions),
 		MaxOutputTokens:  maxOutputTokens,
 		TopP:             call.TopP,
 		Temperature:      call.Temperature,
@@ -801,6 +845,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (result *
 		FrequencyPenalty: call.FrequencyPenalty,
 		PrepareStep: func(callContext context.Context, options fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
 			prepared.Messages = options.Messages
+			if openai.IsResponsesModel(largeModel.CatwalkCfg.ID) {
+				prepared.Messages = stripLeadingSystemMessage(prepared.Messages)
+			}
 			for i := range prepared.Messages {
 				prepared.Messages[i].ProviderOptions = nil
 			}
@@ -1343,9 +1390,12 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
 		Prompt:          summaryPromptText,
 		Messages:        aiMsgs,
-		ProviderOptions: opts,
+		ProviderOptions: openAIResponsesProviderOptions(largeModel, string(summaryPrompt), opts),
 		PrepareStep: func(callContext context.Context, options fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
 			prepared.Messages = options.Messages
+			if openai.IsResponsesModel(largeModel.CatwalkCfg.ID) {
+				prepared.Messages = stripLeadingSystemMessage(prepared.Messages)
+			}
 			if systemPromptPrefix != "" {
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(systemPromptPrefix)}, prepared.Messages...)
 			}
@@ -1688,19 +1738,26 @@ func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, user
 	largeModel := a.largeModel.Get()
 	systemPromptPrefix := a.systemPromptPrefix.Get()
 
-	newAgent := func(m fantasy.LanguageModel, p []byte, tok int64) fantasy.Agent {
-		return fantasy.NewAgent(
-			m,
-			fantasy.WithSystemPrompt(string(p)+"\n /no_think"),
-			fantasy.WithMaxOutputTokens(tok),
+	newAgent := func(m fantasy.LanguageModel, model Model, p []byte, tok int64) fantasy.Agent {
+		systemPrompt := string(p) + "\n /no_think"
+		opts := []fantasy.AgentOption{
+			fantasy.WithSystemPrompt(systemPrompt),
 			fantasy.WithUserAgent(userAgent),
-		)
+		}
+		if openAIResponsesSupportsMaxOutputTokens(model) {
+			opts = append(opts, fantasy.WithMaxOutputTokens(tok))
+		}
+		return fantasy.NewAgent(m, opts...)
 	}
 
+	currentTitleModel := largeModel
 	streamCall := fantasy.AgentStreamCall{
 		Prompt: fmt.Sprintf("Generate a concise title for the following content:\n\n%s\n <think>\n\n</think>", userPrompt),
 		PrepareStep: func(callCtx context.Context, opts fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
 			prepared.Messages = opts.Messages
+			if openai.IsResponsesModel(currentTitleModel.CatwalkCfg.ID) {
+				prepared.Messages = stripLeadingSystemMessage(prepared.Messages)
+			}
 			if systemPromptPrefix != "" {
 				prepared.Messages = append([]fantasy.Message{
 					fantasy.NewSystemMessage(systemPromptPrefix),
@@ -1728,7 +1785,9 @@ func (a *sessionAgent) GenerateTitle(ctx context.Context, sessionID string, user
 		if attempt.model.CatwalkCfg.CanReason {
 			tok = attempt.model.CatwalkCfg.DefaultMaxTokens
 		}
-		agent := newAgent(attempt.model.Model, titlePrompt, tok)
+		currentTitleModel = attempt.model
+		streamCall.ProviderOptions = openAIResponsesProviderOptions(attempt.model, string(titlePrompt)+"\n /no_think", nil)
+		agent := newAgent(attempt.model.Model, attempt.model, titlePrompt, tok)
 		resp, err = agent.Stream(ctx, streamCall)
 		if err == nil && resp.Response.FinishReason != fantasy.FinishReasonLength {
 			model = attempt.model

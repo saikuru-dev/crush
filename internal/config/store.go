@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
+	openaioauth "github.com/charmbracelet/crush/internal/oauth/openai"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	"golang.org/x/sync/singleflight"
@@ -452,18 +453,37 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	var providerConfig ProviderConfig
 	var exists bool
 	var setKeyOrToken func()
+	var clearFlatRate bool
 
 	switch v := apiKey.(type) {
 	case string:
-		if err := s.SetConfigField(scope, fmt.Sprintf("providers.%s.api_key", providerID), v); err != nil {
+		fields := map[string]any{
+			fmt.Sprintf("providers.%s.api_key", providerID): v,
+		}
+		if providerID == string(catwalk.InferenceProviderOpenAI) {
+			fields[fmt.Sprintf("providers.%s.oauth", providerID)] = nil
+			fields[fmt.Sprintf("providers.%s.flat_rate", providerID)] = false
+		}
+		if err := s.SetConfigFields(scope, fields); err != nil {
 			return fmt.Errorf("failed to save api key to config file: %w", err)
 		}
-		setKeyOrToken = func() { providerConfig.APIKey = v }
+		setKeyOrToken = func() {
+			providerConfig.APIKey = v
+			providerConfig.OAuthToken = nil
+			if providerID == string(catwalk.InferenceProviderOpenAI) {
+				providerConfig.FlatRate = false
+			}
+		}
+		clearFlatRate = providerID == string(catwalk.InferenceProviderOpenAI)
 	case *oauth.Token:
-		if err := s.SetConfigFields(scope, map[string]any{
+		fields := map[string]any{
 			fmt.Sprintf("providers.%s.api_key", providerID): v.AccessToken,
 			fmt.Sprintf("providers.%s.oauth", providerID):   v,
-		}); err != nil {
+		}
+		if providerID == string(catwalk.InferenceProviderOpenAI) {
+			fields[fmt.Sprintf("providers.%s.flat_rate", providerID)] = true
+		}
+		if err := s.SetConfigFields(scope, fields); err != nil {
 			return err
 		}
 		setKeyOrToken = func() {
@@ -472,6 +492,8 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 			switch providerID {
 			case string(catwalk.InferenceProviderCopilot):
 				providerConfig.SetupGitHubCopilot()
+			case string(catwalk.InferenceProviderOpenAI):
+				providerConfig.FlatRate = true
 			}
 		}
 	}
@@ -480,6 +502,9 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 	providerConfig, exists = cfg.Providers.Get(providerID)
 	if exists {
 		setKeyOrToken()
+		if clearFlatRate {
+			providerConfig.FlatRate = false
+		}
 		cfg.Providers.Set(providerID, providerConfig)
 		return nil
 	}
@@ -504,6 +529,9 @@ func (s *ConfigStore) SetProviderAPIKey(scope Scope, providerID string, apiKey a
 			Models:       foundProvider.Models,
 		}
 		setKeyOrToken()
+		if clearFlatRate {
+			providerConfig.FlatRate = false
+		}
 	} else {
 		return fmt.Errorf("provider with ID %s not found in known providers", providerID)
 	}
@@ -598,12 +626,14 @@ func (s *ConfigStore) refreshOAuthTokenLocked(ctx context.Context, scope Scope, 
 	providerConfig.APIKey = refreshedToken.AccessToken
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
+		providerConfig.FlatRate = true
 	}
 	cfg.Providers.Set(providerID, providerConfig)
 
 	if err := s.SetConfigFields(scope, map[string]any{
-		fmt.Sprintf("providers.%s.api_key", providerID): refreshedToken.AccessToken,
-		fmt.Sprintf("providers.%s.oauth", providerID):   refreshedToken,
+		fmt.Sprintf("providers.%s.api_key", providerID):   refreshedToken.AccessToken,
+		fmt.Sprintf("providers.%s.oauth", providerID):     refreshedToken,
+		fmt.Sprintf("providers.%s.flat_rate", providerID): providerID == string(catwalk.InferenceProviderOpenAI),
 	}); err != nil {
 		return fmt.Errorf("failed to persist refreshed token: %w", err)
 	}
@@ -640,6 +670,8 @@ func (s *ConfigStore) exchange(ctx context.Context, providerID, refreshToken str
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
 		return copilot.RefreshToken(ctx, refreshToken)
+	case string(catwalk.InferenceProviderOpenAI):
+		return openaioauth.RefreshToken(ctx, refreshToken)
 	case hyperp.Name:
 		return hyper.ExchangeToken(ctx, refreshToken)
 	default:
@@ -664,6 +696,9 @@ func (s *ConfigStore) applyToken(providerConfig ProviderConfig, token *oauth.Tok
 	providerConfig.APIKey = token.AccessToken
 	if providerID == string(catwalk.InferenceProviderCopilot) {
 		providerConfig.SetupGitHubCopilot()
+	}
+	if providerID == string(catwalk.InferenceProviderOpenAI) {
+		providerConfig.FlatRate = true
 	}
 	s.Config().Providers.Set(providerID, providerConfig)
 	return nil

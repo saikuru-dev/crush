@@ -27,17 +27,21 @@ var logoutCmd = &cobra.Command{
 	Long: `Logout Crush from a specified platform, removing stored credentials.
 The platform should be provided as an argument.
 If no argument is given, a list of logged-in platforms will be shown.
-Available platforms are: hyper, copilot.`,
+Available platforms are: hyper, copilot, openai.`,
 	Example: `
 # Sign out from Charm Hyper
 crush logout hyper
 
-# Sign out from GitHub Copilot
-crush logout copilot
-  `,
+	# Sign out from GitHub Copilot
+	crush logout copilot
+
+	# Sign out from OpenAI subscription OAuth
+	crush logout openai
+	  `,
 	ValidArgs: []cobra.Completion{
 		"hyper",
 		"copilot",
+		"openai",
 		"github",
 		"github-copilot",
 	},
@@ -84,6 +88,8 @@ crush logout copilot
 			return logoutHyper(c, ws.ID)
 		case "copilot", "github", "github-copilot":
 			return logoutCopilot(c, ws.ID)
+		case "openai":
+			return logoutOpenAI(c, ws.ID)
 		default:
 			return fmt.Errorf("unknown platform: %s", provider)
 		}
@@ -115,6 +121,21 @@ func logoutCopilot(c *client.Client, wsID string) error {
 	}
 
 	fmt.Println(logoutHeaderStyle.Render("Successfully logged out of GitHub Copilot."))
+	return nil
+}
+
+func logoutOpenAI(c *client.Client, wsID string) error {
+	ctx := getLogoutContext()
+
+	if err := cmp.Or(
+		c.RemoveConfigField(ctx, wsID, config.ScopeGlobal, "providers.openai.api_key"),
+		c.RemoveConfigField(ctx, wsID, config.ScopeGlobal, "providers.openai.oauth"),
+		c.RemoveConfigField(ctx, wsID, config.ScopeGlobal, "providers.openai.flat_rate"),
+	); err != nil {
+		return err
+	}
+
+	fmt.Println(logoutHeaderStyle.Render("Successfully logged out of OpenAI subscription OAuth."))
 	return nil
 }
 

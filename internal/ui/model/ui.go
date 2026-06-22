@@ -152,10 +152,10 @@ type (
 	// closeDialogMsg is sent to close the current dialog.
 	closeDialogMsg struct{}
 
-	// hyperRefreshDoneMsg is sent after a silent Hyper OAuth refresh
-	// finishes. It carries the original model-selection action so the
-	// selection can be resumed.
-	hyperRefreshDoneMsg struct {
+	// oauthRefreshDoneMsg is sent after a silent OAuth refresh finishes.
+	// It carries the original model-selection action so the selection can
+	// be resumed.
+	oauthRefreshDoneMsg struct {
 		action dialog.ActionSelectModel
 	}
 
@@ -1047,7 +1047,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		cmds = append(cmds, m.loadPromptHistory())
-	case hyperRefreshDoneMsg:
+	case oauthRefreshDoneMsg:
 		if cmd := m.handleSelectModel(msg.action); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
@@ -1529,6 +1529,10 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		if msg.Cmd != nil {
 			cmds = append(cmds, msg.Cmd)
 		}
+	case dialog.ActionSelectOpenAIAuthMethod:
+		if cmd := m.openOpenAIAuthDialog(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 
 	// Session dialog messages.
 	case dialog.ActionSelectSession:
@@ -1782,19 +1786,19 @@ func substituteArgs(content string, args map[string]string) string {
 	return content
 }
 
-// refreshHyperAndRetrySelect returns a command that silently refreshes
-// the Hyper OAuth token and then re-runs the model selection. If the
+// refreshOAuthAndRetrySelect returns a command that silently refreshes
+// the provider OAuth token and then re-runs the model selection. If the
 // refresh fails, the selection resumes with ReAuthenticate set so the
-// OAuth dialog opens.
-func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
+// auth flow opens.
+func (m *UI) refreshOAuthAndRetrySelect(providerID string, msg dialog.ActionSelectModel) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := m.com.Workspace.RefreshOAuthToken(ctx, config.ScopeGlobal, "hyper"); err != nil {
-			slog.Warn("Hyper OAuth refresh failed, requesting re-auth", "error", err)
+		if err := m.com.Workspace.RefreshOAuthToken(ctx, config.ScopeGlobal, providerID); err != nil {
+			slog.Warn("OAuth refresh failed, requesting re-auth", "provider", providerID, "error", err)
 			msg.ReAuthenticate = true
 		}
-		return hyperRefreshDoneMsg{action: msg}
+		return oauthRefreshDoneMsg{action: msg}
 	}
 }
 
@@ -1865,13 +1869,17 @@ func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 		isOnboarding = m.state == uiOnboarding
 	)
 
-	// For Hyper, if the stored OAuth token is expired, try a silent
-	// refresh before deciding whether the provider is configured. Keeps
-	// users from hitting a 401 on their first message after the
-	// short-lived access token ages out.
-	if !msg.ReAuthenticate && providerID == "hyper" {
+	// If the stored OAuth token is expired, try a silent refresh before
+	// deciding whether the provider is configured.
+	if !msg.ReAuthenticate {
 		if pc, ok := cfg.Providers.Get(providerID); ok && pc.OAuthToken != nil && pc.OAuthToken.IsExpired() {
-			return m.refreshHyperAndRetrySelect(msg)
+			return m.refreshOAuthAndRetrySelect(providerID, msg)
+		}
+	}
+
+	if msg.ReAuthenticate && providerID == string(catwalk.InferenceProviderOpenAI) {
+		if pc, ok := cfg.Providers.Get(providerID); ok && pc.OAuthToken != nil {
+			return util.ReportWarn("OpenAI subscription OAuth needs `crush login openai` to refresh.")
 		}
 	}
 
@@ -1926,6 +1934,7 @@ func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 
 	m.dialog.CloseDialog(dialog.APIKeyInputID)
 	m.dialog.CloseDialog(dialog.OAuthID)
+	m.dialog.CloseDialog(dialog.OAuthOpenAIID)
 	m.dialog.CloseDialog(dialog.ModelsID)
 
 	if isOnboarding {
@@ -1954,8 +1963,39 @@ func (m *UI) openAuthenticationDialog(provider catwalk.Provider, model config.Se
 		dlg, cmd = dialog.NewOAuthHyper(m.com, isOnboarding, provider, model, modelType)
 	case catwalk.InferenceProviderCopilot:
 		dlg, cmd = dialog.NewOAuthCopilot(m.com, isOnboarding, provider, model, modelType)
+	case catwalk.InferenceProviderOpenAI:
+		dlg, cmd = dialog.NewOpenAIAuthChoice(m.com, isOnboarding, provider, model, modelType)
 	default:
 		dlg, cmd = dialog.NewAPIKeyInput(m.com, isOnboarding, provider, model, modelType)
+	}
+
+	if m.dialog.ContainsDialog(dlg.ID()) {
+		m.dialog.BringToFront(dlg.ID())
+		return nil
+	}
+
+	m.dialog.OpenDialogWithGrace(dlg)
+	return cmd
+}
+
+func (m *UI) openOpenAIAuthDialog(msg dialog.ActionSelectOpenAIAuthMethod) tea.Cmd {
+	var (
+		dlg dialog.Dialog
+		cmd tea.Cmd
+		err error
+	)
+
+	if msg.Method == "browser" {
+		dlg, cmd, err = dialog.NewOAuthOpenAI(m.com, m.state == uiOnboarding, msg.Provider, msg.Model, msg.ModelType)
+	} else {
+		dlg, cmd = dialog.NewAPIKeyInput(m.com, m.state == uiOnboarding, msg.Provider, msg.Model, msg.ModelType)
+	}
+	if err != nil {
+		return util.ReportError(err)
+	}
+
+	if m.dialog.ContainsDialog(dialog.OpenAIAuthChoiceID) {
+		m.dialog.CloseDialog(dialog.OpenAIAuthChoiceID)
 	}
 
 	if m.dialog.ContainsDialog(dlg.ID()) {

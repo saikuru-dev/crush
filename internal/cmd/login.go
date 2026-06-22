@@ -3,10 +3,12 @@ package cmd
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 
+	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/clipboard"
@@ -14,6 +16,7 @@ import (
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
 	"github.com/charmbracelet/crush/internal/oauth/hyper"
+	openaioauth "github.com/charmbracelet/crush/internal/oauth/openai"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
@@ -25,20 +28,24 @@ var loginCmd = &cobra.Command{
 	Short:   "Login Crush to a platform",
 	Long: `Login Crush to a specified platform.
 The platform should be provided as an argument.
-Available platforms are: hyper, copilot.`,
+Available platforms are: hyper, copilot, openai.`,
 	Example: `
 # Authenticate with Charm Hyper
 crush login
 
-# Authenticate with GitHub Copilot
-crush login copilot
+	# Authenticate with GitHub Copilot
+	crush login copilot
 
-# Force re-authentication even if already logged in
-crush login -f copilot
+	# Authenticate with OpenAI subscription OAuth
+	crush login openai
+
+	# Force re-authentication even if already logged in
+	crush login -f copilot
   `,
 	ValidArgs: []cobra.Completion{
 		"hyper",
 		"copilot",
+		"openai",
 		"github",
 		"github-copilot",
 	},
@@ -66,6 +73,8 @@ crush login -f copilot
 			return loginHyper(c, ws.ID, force)
 		case "copilot", "github", "github-copilot":
 			return loginCopilot(c, ws.ID, force)
+		case "openai":
+			return loginOpenAI(c, ws.ID, force)
 		default:
 			return fmt.Errorf("unknown platform: %s", args[0])
 		}
@@ -211,6 +220,64 @@ func loginCopilot(c *client.Client, wsID string, force bool) error {
 
 	fmt.Println()
 	fmt.Println("You're now authenticated with GitHub Copilot!")
+	return nil
+}
+
+func loginOpenAI(c *client.Client, wsID string, force bool) error {
+	loginCtx := getLoginContext()
+
+	if !force {
+		cfg, err := c.GetConfig(loginCtx, wsID)
+		if err == nil && cfg != nil {
+			if pc, ok := cfg.Providers.Get(string(catwalk.InferenceProviderOpenAI)); ok && pc.OAuthToken != nil {
+				fmt.Println("You are already logged in to OpenAI subscription OAuth.")
+				fmt.Println("Use --force to re-authenticate.")
+				return nil
+			}
+		}
+	}
+
+	session, err := openaioauth.StartBrowserAuth(loginCtx)
+	if err != nil {
+		if !errors.Is(err, openaioauth.ErrBrowserUnavailable) {
+			return err
+		}
+		fmt.Println("Browser OAuth is unavailable, falling back to device authorization...")
+		token, err := openaioauth.DeviceAuth(loginCtx)
+		if err != nil {
+			return err
+		}
+		return saveOpenAIToken(loginCtx, c, wsID, token)
+	}
+	defer session.Close()
+
+	clipboard.WriteText(session.URL)
+	fmt.Println("Open the following URL to authenticate with OpenAI subscription OAuth:")
+	fmt.Println()
+	fmt.Println(lipgloss.NewStyle().Hyperlink(session.URL, "id=openai").Render(session.URL))
+	fmt.Println()
+	fmt.Println("Press enter to open the URL in your browser, or paste it manually.")
+	fmt.Println()
+	waitEnter()
+	if err := browser.OpenURL(session.URL); err != nil {
+		fmt.Println("Could not open the URL. You'll need to manually open it in your browser.")
+	}
+
+	token, err := session.Wait(loginCtx)
+	if err != nil {
+		return err
+	}
+
+	return saveOpenAIToken(loginCtx, c, wsID, token)
+}
+
+func saveOpenAIToken(ctx context.Context, c *client.Client, wsID string, token *oauth.Token) error {
+	if err := c.SetProviderAPIKey(ctx, wsID, config.ScopeGlobal, string(catwalk.InferenceProviderOpenAI), token); err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Println("You're now authenticated with OpenAI subscription OAuth!")
 	return nil
 }
 
